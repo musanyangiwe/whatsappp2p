@@ -76,9 +76,16 @@ app.post('/initiate-transfer', async (req, res) => {
       amount
     });
 
+    // Also log the OTP (for debugging)
+    await logAction('generated_otp', sender_phone, {
+      txn_id,
+      code: otp_code
+    });
+
     res.json({
       success: true,
       txn_id,
+      otp_code,
       message: `Transfer initiated. OTP sent to receiver. R${amount} ready for ATM withdrawal.`
     });
   } catch (error) {
@@ -188,96 +195,10 @@ app.post('/atm-withdraw', async (req, res) => {
       .eq('txn_id', txn_id)
       .single();
 
-    if (!otp || otp.code !== otp_code) {
-      return res.status(400).json({ error: 'Invalid OTP' });
-    }
-
-    // Mark as withdrawn
-    await supabase
-      .from('transactions')
-      .update({
-        status: 'withdrawn',
-        completed_at: new Date()
-      })
-      .eq('txn_id', txn_id);
-
-    await supabase
-      .from('otps')
-      .update({ atm_location })
-      .eq('id', otp.id);
-
-    await logAction('atm_withdrawal', receiver_phone, { 
-      txn_id,
-      amount: txn.amount,
-      atm_location
-    });
-
-    res.json({
-      success: true,
-      txn_id,
-      status: 'withdrawn',
-      amount: txn.amount,
-      message: `✅ R${txn.amount} withdrawn at ${atm_location}`
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 4. Transaction Status
-app.get('/transaction-status/:txn_id', async (req, res) => {
-  try {
-    const { txn_id } = req.params;
-
-    const { data, error } = await supabase
-      .from('transactions')
-      .select('*')
-      .eq('txn_id', txn_id)
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: 'Transaction not found' });
-    }
-
-    res.json({
-      txn_id: data.txn_id,
-      status: data.status,
-      sender_phone: data.sender_phone,
-      receiver_phone: data.receiver_phone,
-      amount: data.amount,
-      created_at: data.created_at,
-      completed_at: data.completed_at
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 5. Admin Logs
-app.get('/admin-logs', async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('logs')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(100);
-
-    if (error) throw error;
-
-    res.json({
-      total: data.length,
-      logs: data
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+    if (!otp || otp.code
+git add app.js
+git commit -m "Add OTP logging and return"
+git push origin main
+grep "otp_code" app.js
+[200~grep "otp_code" app.js~
+E0F
