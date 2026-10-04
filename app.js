@@ -41,7 +41,6 @@ app.post('/initiate-transfer', async (req, res) => {
   try {
     const { sender_phone, receiver_phone, amount } = req.body;
 
-    // Validate inputs
     if (!sender_phone || !receiver_phone || !amount) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -50,22 +49,27 @@ app.post('/initiate-transfer', async (req, res) => {
       return res.status(400).json({ error: 'Amount must be between R1 and R10,000' });
     }
 
-    // Generate transaction ID
     const txn_id = generateTxnId();
+    const otp_code = generateOTP();
 
-    // Create transaction record
-    const { data, error } = await supabase.from('transactions').insert({
+    // Create transaction
+    await supabase.from('transactions').insert({
       txn_id,
       sender_phone,
       receiver_phone,
       amount,
-      method: 'account_deposit',
-      status: 'initiated'
+      method: 'atm_withdrawal',
+      status: 'otp_sent'
     });
 
-    if (error) throw error;
+    // Store OTP
+    await supabase.from('otps').insert({
+      txn_id,
+      code: otp_code,
+      expiry: new Date(Date.now() + 2 * 60 * 60 * 1000)
+    });
 
-    // Log the action
+    // Log
     await logAction('initiated_transfer', sender_phone, {
       txn_id,
       receiver_phone,
@@ -75,7 +79,7 @@ app.post('/initiate-transfer', async (req, res) => {
     res.json({
       success: true,
       txn_id,
-      message: 'Transfer initiated. Generating OTP...'
+      message: `Transfer initiated. OTP sent to receiver. R${amount} ready for ATM withdrawal.`
     });
   } catch (error) {
     console.error(error);
@@ -83,16 +87,16 @@ app.post('/initiate-transfer', async (req, res) => {
   }
 });
 
-// 2. Generate OTP
-app.post('/generate-otp', async (req, res) => {
+// 2. Validate OTP
+app.post('/validate-otp', async (req, res) => {
   try {
-    const { txn_id } = req.body;
+    const { txn_id, otp_code, receiver_phone } = req.body;
 
-    if (!txn_id) {
-      return res.status(400).json({ error: 'txn_id required' });
+    if (!txn_id || !otp_code || !receiver_phone) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Check if transaction exists
+    // Get transaction
     const { data: txn, error: txnError } = await supabase
       .from('transactions')
       .select('*')
@@ -103,46 +107,7 @@ app.post('/generate-otp', async (req, res) => {
       return res.status(404).json({ error: 'Transaction not found' });
     }
 
-    // Generate OTP (6 digits)
-    const code = generateOTP();
-    const expiry = new Date(Date.now() + 2 * 60 * 60 * 1000); // 2 hours
-
-    // Store OTP
-    const { error: otpError } = await supabase.from('otps').insert({
-      txn_id,
-      code,
-      expiry
-    });
-
-    if (otpError) throw otpError;
-
-    // Log action
-    await logAction('generated_otp', txn.sender_phone, { txn_id, code });
-
-    // In real world, send via Twilio SMS/WhatsApp
-    // For now, return code (demo purposes)
-    res.json({
-      success: true,
-      txn_id,
-      otp_code: code,
-      message: 'OTP generated. Send via WhatsApp to receiver.'
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 3. Validate OTP
-app.post('/validate-otp', async (req, res) => {
-  try {
-    const { txn_id, otp_code, receiver_phone } = req.body;
-
-    if (!txn_id || !otp_code || !receiver_phone) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-
-    // Get OTP record
+    // Get OTP
     const { data: otp, error: otpError } = await supabase
       .from('otps')
       .select('*')
@@ -153,17 +118,14 @@ app.post('/validate-otp', async (req, res) => {
       return res.status(404).json({ error: 'OTP not found' });
     }
 
-    // Check if already used
     if (otp.used) {
       return res.status(400).json({ error: 'OTP already used' });
     }
 
-    // Check if expired
     if (new Date() > new Date(otp.expiry)) {
       return res.status(400).json({ error: 'OTP expired' });
     }
 
-    // Check if code matches
     if (otp.code !== otp_code) {
       return res.status(400).json({ error: 'Invalid OTP' });
     }
@@ -174,29 +136,20 @@ app.post('/validate-otp', async (req, res) => {
       .update({ used: true, used_at: new Date() })
       .eq('id', otp.id);
 
-    // Update transaction to completed
-    const { data: txn } = await supabase
-      .from('transactions')
-      .select('*')
-      .eq('txn_id', txn_id)
-      .single();
-
+    // Mark transaction ready for withdrawal
     await supabase
       .from('transactions')
-      .update({
-        status: 'completed',
-        completed_at: new Date()
-      })
+      .update({ status: 'ready_for_withdrawal' })
       .eq('txn_id', txn_id);
 
-    // Log action
     await logAction('validated_otp', receiver_phone, { txn_id });
 
     res.json({
       success: true,
       txn_id,
-      status: 'completed',
-      message: 'Transfer completed successfully'
+      status: 'ready_for_withdrawal',
+      amount: txn.amount,
+      message: `✅ OTP validated! R${txn.amount} ready at ATM`
     });
   } catch (error) {
     console.error(error);
@@ -204,7 +157,75 @@ app.post('/validate-otp', async (req, res) => {
   }
 });
 
-// 4. Get Transaction Status
+// 3. ATM Withdraw
+app.post('/atm-withdraw', async (req, res) => {
+  try {
+    const { txn_id, receiver_phone, otp_code, atm_location } = req.body;
+
+    if (!txn_id || !receiver_phone || !otp_code) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Get transaction
+    const { data: txn, error: txnError } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('txn_id', txn_id)
+      .single();
+
+    if (txnError || !txn) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    if (txn.status !== 'ready_for_withdrawal') {
+      return res.status(400).json({ error: 'Transaction not ready for withdrawal' });
+    }
+
+    // Get & verify OTP
+    const { data: otp } = await supabase
+      .from('otps')
+      .select('*')
+      .eq('txn_id', txn_id)
+      .single();
+
+    if (!otp || otp.code !== otp_code) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+
+    // Mark as withdrawn
+    await supabase
+      .from('transactions')
+      .update({
+        status: 'withdrawn',
+        completed_at: new Date()
+      })
+      .eq('txn_id', txn_id);
+
+    await supabase
+      .from('otps')
+      .update({ atm_location })
+      .eq('id', otp.id);
+
+    await logAction('atm_withdrawal', receiver_phone, { 
+      txn_id,
+      amount: txn.amount,
+      atm_location
+    });
+
+    res.json({
+      success: true,
+      txn_id,
+      status: 'withdrawn',
+      amount: txn.amount,
+      message: `✅ R${txn.amount} withdrawn at ${atm_location}`
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 4. Transaction Status
 app.get('/transaction-status/:txn_id', async (req, res) => {
   try {
     const { txn_id } = req.params;
